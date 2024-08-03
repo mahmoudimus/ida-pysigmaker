@@ -1,4 +1,5 @@
 import ctypes
+import ctypes.wintypes as w
 import enum
 import re
 
@@ -7,7 +8,6 @@ import ida_ida
 import ida_idaapi
 import ida_kernwin
 import idaapi
-import win32clipboard
 
 import idc
 
@@ -102,36 +102,80 @@ def TrimSignature(signature: Signature):
 
 
 def SetClipboardText(text: str) -> bool:
-    GMEM_MOVEABLE = 2
+
+    GMEM_MOVEABLE = 0x0002
+    GMEM_ZEROINIT = 0x0040
+    CF_TEXT = 1
+
+    u32 = ctypes.WinDLL("user32")
+    k32 = ctypes.WinDLL("kernel32")
+
+    GlobalAlloc = k32.GlobalAlloc
+    GlobalAlloc.argtypes = w.UINT, w.UINT
+    GlobalAlloc.restype = w.HGLOBAL
+
+    GlobalFree = k32.GlobalFree
+    GlobalFree.argtypes = (w.HGLOBAL,)
+    GlobalFree.restype = w.HGLOBAL
+
+    SetClipboardData = u32.SetClipboardData
+    SetClipboardData.argtypes = w.UINT, w.HANDLE
+    SetClipboardData.restype = w.HANDLE
+
+    EmptyClipboard = u32.EmptyClipboard
+
+    OpenClipboard = u32.OpenClipboard
+    OpenClipboard.argtypes = (w.HWND,)
+    OpenClipboard.restype = w.BOOL
+
+    GlobalLock = k32.GlobalLock
+    GlobalLock.argtypes = (w.HGLOBAL,)
+    GlobalLock.restype = w.LPVOID
+
+    GlobalUnlock = k32.GlobalUnlock
+    GlobalUnlock.argtypes = (w.HGLOBAL,)
+    GlobalUnlock.restype = w.BOOL
+
+    GetClipboardData = u32.GetClipboardData
+    GetClipboardData.argtypes = (w.UINT,)
+    GetClipboardData.restype = w.HANDLE
+
+    CloseClipboard = u32.CloseClipboard
+    CloseClipboard.argtypes = None
+    CloseClipboard.restype = w.BOOL
 
     if not text:
         return False
 
+    if not OpenClipboard(None) or not EmptyClipboard():
+        return False
+
     try:
-        win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        hGlobal = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(text) + 1)
-        if not hGlobal:
-            win32clipboard.CloseClipboard()
+        # Allocate global memory
+        h_mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(text) + 1)
+        if not h_mem:
             return False
 
-        text_mem = ctypes.windll.kernel32.GlobalLock(hGlobal)
-        if not text_mem:
-            ctypes.windll.kernel32.GlobalFree(hGlobal)
-            win32clipboard.CloseClipboard()
+        # Lock the handle and copy the text
+        lp_str = GlobalLock(h_mem)
+        if not lp_str:
+            GlobalFree(h_mem)
             return False
 
-        ctypes.memmove(text_mem, text.encode("utf-8"), len(text) + 1)
-        ctypes.windll.kernel32.GlobalUnlock(hGlobal)
+        ctypes.memmove(lp_str, text.encode("utf-8"), len(text))
+        GlobalUnlock(h_mem)
 
-        win32clipboard.SetClipboardData(win32clipboard.CF_TEXT, hGlobal)
-        ctypes.windll.kernel32.GlobalFree(hGlobal)
-        win32clipboard.CloseClipboard()
-
-        return True
+        # Set the clipboard data
+        if not SetClipboardData(CF_TEXT, h_mem):
+            GlobalFree(h_mem)
+            return False
     except Exception as e:
         print(f"Failed to set clipboard text: {e}")
         return False
+    finally:
+        CloseClipboard()
+
+    return True
 
 
 def GetRegexMatches(string: str, regex: re.Pattern, matches: list[str]) -> bool:
@@ -144,17 +188,15 @@ class Unexpected(Exception):
     pass
 
 
-# "Select action:\n"                                                      // Title
-# "<Create unique Signature for current code address:R>\n"                // Radio Button 0
-# "<Find shortest XREF Signature for current data or code address:R>\n"	// Radio Button 1
-# "<Copy selected code:R>\n"                                              // Radio Button 2
-# "<Search for a signature:R>>\n"                                         // Radio Button 3
 class SignatureMakerForm(ida_kernwin.Form):
+    FormChangeCb: ida_kernwin.Form.FormChangeCb
+    rAction: ida_kernwin.Form.RadGroupControl
+    rOutputFormat: ida_kernwin.Form.RadGroupControl
+    cGroupOptions: ida_kernwin.Form.ChkGroupControl
+
     def __init__(self):
-        F = ida_kernwin.Form
-        F.__init__(
-            self,
-            f"""BUTTON YES* OK
+        form = f"""\
+BUTTON YES* OK
 BUTTON CANCEL Cancel
 {PLUGIN_NAME} v{PLUGIN_VERSION}
 {{FormChangeCb}}
@@ -173,37 +215,38 @@ Output format:
 Options:
 <Wildcards for operands:{{cWildcardOperands}}>
 <Continue when leaving function scope:{{cContinueOutside}}>{{cGroupOptions}}>
-
-""",
-            {
-                "FormChangeCb": F.FormChangeCb(self.OnFormChange),
-                "rAction": F.RadGroupControl(
-                    (
-                        "rCreateUniqueSig",
-                        "rFindXRefSig",
-                        "rCopyCode",
-                        "rSearchSignature",
-                    )
-                ),
-                "rOutputFormat": F.RadGroupControl(
-                    (
-                        "rIDASig",
-                        "rx64DbgSig",
-                        "rByteArrayMaskSig",
-                        "rRawBytesBitmaskSig",
-                    )
-                ),
-                "cGroupOptions": F.ChkGroupControl(
-                    ("cWildcardOperands", "cContinueOutside")
-                ),
-            },
-        )
+"""
+        controls = {
+            "FormChangeCb": ida_kernwin.Form.FormChangeCb(self.OnFormChange),
+            "rAction": ida_kernwin.Form.RadGroupControl(
+                (
+                    "rCreateUniqueSig",
+                    "rFindXRefSig",
+                    "rCopyCode",
+                    "rSearchSignature",
+                )
+            ),
+            "rOutputFormat": ida_kernwin.Form.RadGroupControl(
+                (
+                    "rIDASig",
+                    "rx64DbgSig",
+                    "rByteArrayMaskSig",
+                    "rRawBytesBitmaskSig",
+                )
+            ),
+            "cGroupOptions": ida_kernwin.Form.ChkGroupControl(
+                ("cWildcardOperands", "cContinueOutside")
+            ),
+        }
+        super().__init__(form, controls)
 
     def OnFormChange(self, fid):
         # Debug output for when the form changes
         # print(f"Form changed, fid: {fid}", self.rAction.id, self.rOutputFormat.id, self.cGroupOptions.id)
         if fid == self.rAction.id:
-            print(f"Action [{fid}] rAction changed: {self.GetControlValue(self.rAction):06x}")
+            print(
+                f"Action [{fid}] rAction changed: {self.GetControlValue(self.rAction):06x}"
+            )
         elif fid == self.rOutputFormat.id:
             print(
                 f"Action [{fid}] rOutputFormat changed: {self.GetControlValue(self.rOutputFormat):06x}"
@@ -274,9 +317,7 @@ class PySigMaker(ida_idaapi.plugin_t):
 
         elif action == 2:
             # Print selected code as signature
-            start, end = ida_kernwin.read_range_selection(
-                idaapi.get_current_viewer()
-            )
+            start, end = ida_kernwin.read_range_selection(idaapi.get_current_viewer())
             if start and end:
                 idaapi.show_wait_box("Please stand by...")
                 self.PrintSelectedCode(start, end, sig_type, wildcard_operands)
@@ -286,9 +327,7 @@ class PySigMaker(ida_idaapi.plugin_t):
 
         elif action == 3:
             # Search for a signature
-            input_signature = idaapi.ask_str(
-                "", idaapi.HIST_SRCH, "Enter a signature"
-            )
+            input_signature = idaapi.ask_str("", idaapi.HIST_SRCH, "Enter a signature")
             if input_signature:
                 idaapi.show_wait_box("Searching...")
                 self.SearchSignatureString(input_signature)
@@ -315,7 +354,7 @@ class PySigMaker(ida_idaapi.plugin_t):
         return False
 
     def GetOperand(self, instruction, operand_offset, operand_length):
-        if self.IsARM():
+        if self.IS_ARM:
             return self.GetOperandOffsetARM(instruction, operand_offset, operand_length)
 
         for op in instruction.ops:
@@ -524,7 +563,7 @@ class PySigMaker(ida_idaapi.plugin_t):
 
     def PrintSignatureForEA(self, signature, ea, sig_type):
         if not signature:
-            idc.msg(f"Error: {signature()}\n")
+            idc.msg(f"Error: {signature}\n")
             return
         signature_str = FormatSignature(signature, sig_type)
         idc.msg(f"Signature for {ea:X}: {signature_str}\n")
@@ -635,9 +674,9 @@ class PySigMaker(ida_idaapi.plugin_t):
                 converted_signature_string = BuildIDASignatureString(
                     converted_signature
                 )
-            elif GetRegexMatches(
-                input, SIGNATURE_REGEX_2, raw_byte_strings
-            ) and len(raw_byte_strings) == len(string_mask):
+            elif GetRegexMatches(input, SIGNATURE_REGEX_2, raw_byte_strings) and len(
+                raw_byte_strings
+            ) == len(string_mask):
                 converted_signature = []
                 for i, m in enumerate(raw_byte_strings):
                     b = SignatureByte(int(m[2:], 16), string_mask[i] == "?")
@@ -674,7 +713,8 @@ class PySigMaker(ida_idaapi.plugin_t):
 def PLUGIN_ENTRY():
     return PySigMaker()
 
-PySigMaker().run(None)
+
+# PySigMaker().run(None)
 # form = SignatureMakerForm()
 # form.Compile()
 
