@@ -1,26 +1,249 @@
+"""
+sigmaker.py - IDA Python port of Signature Maker (from A200K)
+https://github.com/mahmoudimus/ida-pysigmaker
+
+by @mahmoudimus (Mahmoud Abdelkader)
+"""
 import ctypes
-import ctypes.wintypes as w
 import enum
+import os
+import platform
 import re
+import sys
+import traceback
 
 import ida_bytes
 import ida_ida
 import ida_idaapi
 import ida_kernwin
+import ida_xref
 import idaapi
-
 import idc
 
 
-SIGNATURE_REGEX = re.compile(r"\\x[0-9A-F]{2}")
-SIGNATURE_REGEX_2 = re.compile(r"((?:0x[0-9A-F]{2})+)")
+def _IsProcessorFeaturePresent(feature: int) -> bool:
+    if platform.system() != "Windows":
+        return False
+
+    try:
+        is_present = ctypes.windll.kernel32.IsProcessorFeaturePresent(feature)
+    except Exception:
+        is_present = False
+    return is_present
 
 
-PLUGIN_NAME = "Signature Maker Python"
-PLUGIN_VERSION = "1.0.3"
+def _IsAVX2Available() -> bool:
+    # Check for AVX2 feature to enable QIS signature scanning.
+    PF_AVX2_INSTRUCTIONS_AVAILABLE = 10    
+    return _IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)
+
+        
+# Globals 
+__author__ = "mahmoudimus"
+__version__ = "1.0.9"
+
+PLUGIN_NAME = "Signature Maker (py)"
+PLUGIN_VERSION = __version__
+PLUGIN_AUTHOR = __author__
+USE_QIS_SIGNATURE = False # _IsAVX2Available()
+WILDCARD_OPTIMIZED_INSTRUCTION = True
+PRINT_TOP_X = 5
+MAX_SINGLE_SIGNATURE_LENGTH = 1000
+MAX_XREF_SIGNATURE_LENGTH = 250
+FILE_BUFFER = None
+WildcardableOperandTypeBitmask = 0  # Will be set based on processor
+
+# Helpers
+
+def BIT(x):
+    return 1 << x
 
 
-# Signature types and structures
+class ProgressDialog:
+    def __init__(self, message="Please wait...", hide_cancel=False):
+        self._default_msg: str
+        self.hide_cancel: bool
+        self.configure(message, hide_cancel)
+
+    def _message(self, message=None, hide_cancel=None):
+        display_msg = self._default_msg if message is None else message
+        hide_cancel = self.hide_cancel if hide_cancel is None else hide_cancel
+        prefix = "HIDECANCEL\n" if hide_cancel else ""
+        return prefix + display_msg
+
+    def configure(self, message="Please wait...", hide_cancel=False):
+        self._default_msg = message
+        self.hide_cancel = hide_cancel
+        return self
+
+    __call__ = configure
+
+    def __enter__(self):
+        ida_kernwin.show_wait_box(self._message())
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        ida_kernwin.hide_wait_box()
+
+    def replace_message(self, new_message, hide_cancel=False):
+        msg = self._message(message=new_message, hide_cancel=hide_cancel)
+        ida_kernwin.replace_wait_box(msg)
+
+    def user_canceled(self):
+        return ida_kernwin.user_cancelled()
+
+    user_cancelled = user_canceled
+
+
+class Clipboard:
+    @staticmethod
+    def _set_text_windows(text: str) -> bool:
+        import ctypes.util
+        from ctypes import wintypes as w
+
+        GMEM_MOVEABLE = 0x0002
+        GMEM_ZEROINIT = 0x0040
+        CF_TEXT = 1
+
+        user32 = ctypes.WinDLL("user32")
+        kernel32 = ctypes.WinDLL("kernel32")
+
+        OpenClipboard = user32.OpenClipboard
+        OpenClipboard.argtypes = (w.HWND,)
+        OpenClipboard.restype = w.BOOL
+
+        EmptyClipboard = user32.EmptyClipboard
+        EmptyClipboard.restype = w.BOOL
+
+        GlobalAlloc = kernel32.GlobalAlloc
+        GlobalAlloc.argtypes = (w.UINT, w.UINT)
+        GlobalAlloc.restype = w.HGLOBAL
+
+        GlobalLock = kernel32.GlobalLock
+        GlobalLock.argtypes = (w.HGLOBAL,)
+        GlobalLock.restype = w.LPVOID
+
+        GlobalUnlock = kernel32.GlobalUnlock
+        GlobalUnlock.argtypes = (w.HGLOBAL,)
+        GlobalUnlock.restype = w.BOOL
+
+        SetClipboardData = user32.SetClipboardData
+        SetClipboardData.argtypes = (w.UINT, w.HANDLE)
+        SetClipboardData.restype = w.HANDLE
+
+        CloseClipboard = user32.CloseClipboard
+        CloseClipboard.restype = w.BOOL
+
+        if not text:
+            return False
+
+        if not OpenClipboard(None) or not EmptyClipboard():
+            return False
+
+        h_mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(text) + 1)
+        if not h_mem:
+            CloseClipboard()
+            return False
+
+        lp_str = GlobalLock(h_mem)
+        if not lp_str:
+            kernel32.GlobalFree(h_mem)
+            CloseClipboard()
+            return False
+
+        ctypes.memmove(lp_str, text.encode("utf-8"), len(text))
+        GlobalUnlock(h_mem)
+
+        if not SetClipboardData(CF_TEXT, h_mem):
+            kernel32.GlobalFree(h_mem)
+            CloseClipboard()
+            return False
+
+        CloseClipboard()
+        return True
+
+    @staticmethod
+    def _set_text_macos(text: str) -> bool:
+        import subprocess
+
+        try:
+            process = subprocess.Popen(
+                ["pbcopy"], stdin=subprocess.PIPE, close_fds=True
+            )
+            process.communicate(input=text.encode("utf-8"))
+            return process.returncode == 0
+        except Exception as e:
+            print(f"Error setting clipboard text on macOS: {e}")
+            return False
+
+    @staticmethod
+    def _set_text_linux(text: str) -> bool:
+        import subprocess
+
+        try:
+            process = subprocess.Popen(
+                ["xclip", "-selection", "clipboard"],
+                stdin=subprocess.PIPE,
+                close_fds=True,
+            )
+            process.communicate(input=text.encode("utf-8"))
+            return process.returncode == 0
+        except Exception as e:
+            print(f"Error setting clipboard text on Linux: {e}")
+            return False
+
+    @staticmethod
+    def _set_text_pyqt5(text: str) -> bool:
+        try:
+            from PyQt5.QtWidgets import QApplication
+
+            QApplication.clipboard().setText(text)
+            return True
+        except ImportError:
+            return False
+        except Exception as e:
+            print(f"Error setting clipboard text on PyQt5: {e}")
+            return False
+
+    @classmethod
+    def set_text(cls, text: str) -> bool:
+        """
+        Sets the clipboard text on the current operating system.
+        Returns True on success, False on failure.
+        """
+        # Try to use PyQt5 to set the clipboard text, since
+        # that is cross-platform and doesn't require any
+        # external dependencies.
+        success = cls._set_text_pyqt5(text)
+        if success:
+            return success
+
+        # Otherwise, use the platform-specific method.
+        if sys.platform.startswith("win"):
+            return cls._set_text_windows(text)
+        elif sys.platform == "darwin":
+            return cls._set_text_macos(text)
+        elif sys.platform.startswith("linux"):
+            return cls._set_text_linux(text)
+        else:
+            print("Unsupported operating system")
+            return False
+
+    def __call__(self, text: str) -> bool:
+        """
+        Allow instances of Clipboard to be called like a function.
+        """
+        return self.set_text(text)
+
+
+SetClipboardText = Clipboard.set_text
+
+
+# -------------------------
+# Signature structures and output functions
+# -------------------------
+
+
 class SignatureType(enum.Enum):
     IDA = 0
     x64Dbg = 1
@@ -29,15 +252,14 @@ class SignatureType(enum.Enum):
 
 
 class SignatureByte:
-    def __init__(self, value, isWildcard):
+    def __init__(self, value: int, isWildcard: bool):
         self.value = value
         self.isWildcard = isWildcard
 
 
-Signature = list[SignatureByte]
+Signature = list  # list of SignatureByte
 
 
-# Output functions
 def BuildIDASignatureString(signature: Signature, doubleQM: bool = False) -> str:
     result = []
     # Build hex pattern
@@ -47,14 +269,13 @@ def BuildIDASignatureString(signature: Signature, doubleQM: bool = False) -> str
         else:
             result.append(f"{byte.value:02X}")
         result.append(" ")
-    str_result = "".join(result).rstrip()
-    return str_result
+    s = "".join(result).rstrip()
+    return s
 
 
 def BuildByteArrayWithMaskSignatureString(signature: Signature) -> str:
     pattern = []
     mask = []
-    # Build hex pattern
     for byte in signature:
         pattern.append(f"\\x{byte.value:02X}" if not byte.isWildcard else "\\x00")
         mask.append("x" if not byte.isWildcard else "?")
@@ -64,12 +285,11 @@ def BuildByteArrayWithMaskSignatureString(signature: Signature) -> str:
 def BuildBytesWithBitmaskSignatureString(signature: Signature) -> str:
     pattern = []
     mask = []
-    # Build hex pattern
     for byte in signature:
         pattern.append(f"0x{byte.value:02X}, " if not byte.isWildcard else "0x00, ")
         mask.append("1" if not byte.isWildcard else "0")
     pattern_str = "".join(pattern).rstrip(", ")
-    mask_str = "".join(mask)[::-1]  # Reverse bitmask
+    mask_str = "".join(mask)[::-1]  # Reverse the bitmask
     return pattern_str + " 0b" + mask_str
 
 
@@ -85,10 +305,14 @@ def FormatSignature(signature: Signature, sig_type: SignatureType) -> str:
     return ""
 
 
-# Utility functions
+# -------------------------
+# Utility functions (signature byte addition, trim, clipboard, regex)
+# -------------------------
+
+
 def AddByteToSignature(signature: Signature, address, wildcard: bool):
-    byte = SignatureByte(ida_bytes.get_byte(address), wildcard)
-    signature.append(byte)
+    b = ida_bytes.get_byte(address)
+    signature.append(SignatureByte(b, wildcard))
 
 
 def AddBytesToSignature(signature: Signature, address, count: int, wildcard: bool):
@@ -97,246 +321,160 @@ def AddBytesToSignature(signature: Signature, address, count: int, wildcard: boo
 
 
 def TrimSignature(signature: Signature):
+    # Remove trailing wildcards
     while signature and signature[-1].isWildcard:
         signature.pop()
 
 
-def SetClipboardText(text: str) -> bool:
-
-    GMEM_MOVEABLE = 0x0002
-    GMEM_ZEROINIT = 0x0040
-    CF_TEXT = 1
-
-    u32 = ctypes.WinDLL("user32")
-    k32 = ctypes.WinDLL("kernel32")
-
-    GlobalAlloc = k32.GlobalAlloc
-    GlobalAlloc.argtypes = w.UINT, w.UINT
-    GlobalAlloc.restype = w.HGLOBAL
-
-    GlobalFree = k32.GlobalFree
-    GlobalFree.argtypes = (w.HGLOBAL,)
-    GlobalFree.restype = w.HGLOBAL
-
-    SetClipboardData = u32.SetClipboardData
-    SetClipboardData.argtypes = w.UINT, w.HANDLE
-    SetClipboardData.restype = w.HANDLE
-
-    EmptyClipboard = u32.EmptyClipboard
-
-    OpenClipboard = u32.OpenClipboard
-    OpenClipboard.argtypes = (w.HWND,)
-    OpenClipboard.restype = w.BOOL
-
-    GlobalLock = k32.GlobalLock
-    GlobalLock.argtypes = (w.HGLOBAL,)
-    GlobalLock.restype = w.LPVOID
-
-    GlobalUnlock = k32.GlobalUnlock
-    GlobalUnlock.argtypes = (w.HGLOBAL,)
-    GlobalUnlock.restype = w.BOOL
-
-    GetClipboardData = u32.GetClipboardData
-    GetClipboardData.argtypes = (w.UINT,)
-    GetClipboardData.restype = w.HANDLE
-
-    CloseClipboard = u32.CloseClipboard
-    CloseClipboard.argtypes = None
-    CloseClipboard.restype = w.BOOL
-
-    if not text:
-        return False
-
-    if not OpenClipboard(None) or not EmptyClipboard():
-        return False
-
-    try:
-        # Allocate global memory
-        h_mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(text) + 1)
-        if not h_mem:
-            return False
-
-        # Lock the handle and copy the text
-        lp_str = GlobalLock(h_mem)
-        if not lp_str:
-            GlobalFree(h_mem)
-            return False
-
-        ctypes.memmove(lp_str, text.encode("utf-8"), len(text))
-        GlobalUnlock(h_mem)
-
-        # Set the clipboard data
-        if not SetClipboardData(CF_TEXT, h_mem):
-            GlobalFree(h_mem)
-            return False
-    except Exception as e:
-        print(f"Failed to set clipboard text: {e}")
-        return False
-    finally:
-        CloseClipboard()
-
-    return True
-
-
-def GetRegexMatches(string: str, regex: re.Pattern, matches: list[str]) -> bool:
+def GetRegexMatches(string: str, regex: re.Pattern, matches: list) -> bool:
     matches.clear()
     matches.extend(re.findall(regex, string))
     return bool(matches)
 
 
+# -------------------------
+# Exception for errors
+# -------------------------
 class Unexpected(Exception):
     pass
 
 
 class SignatureMakerForm(ida_kernwin.Form):
-    FormChangeCb: ida_kernwin.Form.FormChangeCb
-    rAction: ida_kernwin.Form.RadGroupControl
-    rOutputFormat: ida_kernwin.Form.RadGroupControl
-    cGroupOptions: ida_kernwin.Form.ChkGroupControl
-
     def __init__(self):
-        form = f"""\
+        F = ida_kernwin.Form
+        form_text = (
+            f"""STARTITEM 0
 BUTTON YES* OK
 BUTTON CANCEL Cancel
-{PLUGIN_NAME} v{PLUGIN_VERSION}
-{{FormChangeCb}}
+Signature Maker v{PLUGIN_VERSION} {("(AVX2)" if USE_QIS_SIGNATURE else "")}"""
+            + r"""
+{FormChangeCb}
 Select action:
-<Create unique Signature for current code address:{{rCreateUniqueSig}}>
-<Find shortest XREF Signature for current data or code address:{{rFindXRefSig}}>
-<Copy selected code:{{rCopyCode}}>
-<Search for a signature:{{rSearchSignature}}>{{rAction}}>
+<#Select an address, and create a code signature for it#Create unique signature for current code address:{rCreateUniqueSig}>
+<#Select an address or variable, and create code signatures for its references. Will output the shortest 5 signatures#Find shortest XREF signature for current data or code address:{rFindXRefSig}>
+<#Select 1+ instructions, and copy the bytes using the specified output format#Copy selected code:{rCopyCode}>
+<#Paste any string containing your signature/mask and find matches#Search for a signature:{rSearchSignature}>{rAction}>
 
 Output format:
-<IDA Signature:{{rIDASig}}>
-<x64Dbg Signature:{{rx64DbgSig}}>
-<C Byte Array Signature + String mask:{{rByteArrayMaskSig}}>
-<C Raw Bytes Signature + Bitmask:{{rRawBytesBitmaskSig}}>{{rOutputFormat}}>
+<#Example - E8 ? ? ? ? 45 33 F6 66 44 89 34 33#IDA Signature:{rIDASig}>
+<#Example - E8 ?? ?? ?? ?? 45 33 F6 66 44 89 34 33#x64Dbg Signature:{rx64DbgSig}>
+<#Example - \\xE8\\x00\\x00\\x00\\x00\\x45\\x33\\xF6\\x66\\x44\\x89\\x34\\x33 x????xxxxxxxx#C Byte Array String Signature + String mask:{rByteArrayMaskSig}>
+<#Example - 0xE8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xF6, 0x66, 0x44, 0x89, 0x34, 0x33 0b1111111100001#C Bytes Signature + Bitmask:{rRawBytesBitmaskSig}>{rOutputFormat}>
 
-Options:
-<Wildcards for operands:{{cWildcardOperands}}>
-<Continue when leaving function scope:{{cContinueOutside}}>{{cGroupOptions}}>
+Quick Options:
+<#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
+<#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
+<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>{cGroupOptions}>
+
+<Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
+        )
         controls = {
-            "FormChangeCb": ida_kernwin.Form.FormChangeCb(self.OnFormChange),
-            "rAction": ida_kernwin.Form.RadGroupControl(
-                (
-                    "rCreateUniqueSig",
-                    "rFindXRefSig",
-                    "rCopyCode",
-                    "rSearchSignature",
-                )
+            "cVersion": F.StringLabel(PLUGIN_VERSION),
+            "FormChangeCb": F.FormChangeCb(self.OnFormChange),
+            # Radio group for selecting the main action.
+            "rAction": F.RadGroupControl(
+                ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature")
             ),
-            "rOutputFormat": ida_kernwin.Form.RadGroupControl(
-                (
-                    "rIDASig",
-                    "rx64DbgSig",
-                    "rByteArrayMaskSig",
-                    "rRawBytesBitmaskSig",
-                )
+            # Radio group for selecting output format.
+            "rOutputFormat": F.RadGroupControl(
+                ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
             ),
+            # Checkboxes for quick options.
             "cGroupOptions": ida_kernwin.Form.ChkGroupControl(
-                ("cWildcardOperands", "cContinueOutside")
+                ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized"),
+                value=5,
             ),
+            # Buttons for further configuration.
+            "bOperandTypes": F.ButtonInput(self.ConfigureOperandWildcardBitmask),
+            "bOtherOptions": F.ButtonInput(self.ConfigureOptions),
         }
-        super().__init__(form, controls)
+        super().__init__(form_text, controls)
 
     def OnFormChange(self, fid):
-        # Debug output for when the form changes
+        # (Optional: add code to respond to field changes.)
         # print(f"Form changed, fid: {fid}", self.rAction.id, self.rOutputFormat.id, self.cGroupOptions.id)
-        if fid == self.rAction.id:
-            print(
-                f"Action [{fid}] rAction changed: {self.GetControlValue(self.rAction):06x}"
-            )
-        elif fid == self.rOutputFormat.id:
-            print(
-                f"Action [{fid}] rOutputFormat changed: {self.GetControlValue(self.rOutputFormat):06x}"
-            )
-        elif fid == self.cGroupOptions.id:
-            print(
-                f"Action [{fid}] cGroupOptions changed: {self.GetControlValue(self.cGroupOptions):06x}"
-            )
-        else:
-            print(">>fid:%d" % fid)
+        # if fid == self.rAction.id:
+        #     print(
+        #         f"Action [{fid}] rAction changed: {self.GetControlValue(self.rAction):06x}"
+        #     )
+        # elif fid == self.rOutputFormat.id:
+        #     print(
+        #         f"Action [{fid}] rOutputFormat changed: {self.GetControlValue(self.rOutputFormat):06x}"
+        #     )
+        # elif fid == self.cGroupOptions.id:
+        #     print(
+        #         f"Action [{fid}] cGroupOptions changed: {self.GetControlValue(self.cGroupOptions):06x}"
+        #     )
+        # else:
+        #     print(">>fid:%d" % fid)
+        return 1
+
+    def ConfigureOperandWildcardBitmask(self, code=0):
+        global WildcardableOperandTypeBitmask
+        current = hex(WildcardableOperandTypeBitmask)
+        new_val = ida_kernwin.ask_str(
+            current, 0, "Enter new WildcardableOperandTypeBitmask (hex):"
+        )
+        if new_val:
+            try:
+                WildcardableOperandTypeBitmask = int(new_val, 16)
+            except Exception:
+                ida_kernwin.info("Invalid input for operand bitmask.")
+        return 1
+
+    def ConfigureOptions(self, code=0):
+        global PRINT_TOP_X, MAX_SINGLE_SIGNATURE_LENGTH, MAX_XREF_SIGNATURE_LENGTH
+        current = (
+            f"{PRINT_TOP_X},{MAX_SINGLE_SIGNATURE_LENGTH},{MAX_XREF_SIGNATURE_LENGTH}"
+        )
+        new_val = ida_kernwin.ask_str(
+            current,
+            0,
+            "Enter PRINT_TOP_X, MAX_SINGLE_SIGNATURE_LENGTH, MAX_XREF_SIGNATURE_LENGTH (comma-separated):",
+        )
+        if new_val:
+            parts = new_val.split(",")
+            if len(parts) >= 3:
+                try:
+                    PRINT_TOP_X = int(parts[0].strip())
+                    MAX_SINGLE_SIGNATURE_LENGTH = int(parts[1].strip())
+                    MAX_XREF_SIGNATURE_LENGTH = int(parts[2].strip())
+                except Exception:
+                    ida_kernwin.info("Invalid input for options.")
         return 1
 
 
-# Plugin specific definitions
+# -------------------------
+# The main plugin class
+# -------------------------
 class PySigMaker(ida_idaapi.plugin_t):
+    flags = ida_idaapi.PLUGIN_KEEP
+    comment = f"{PLUGIN_NAME} v{PLUGIN_VERSION} for IDA Pro by {PLUGIN_AUTHOR}"
+    help = "Select location in disassembly and press CTRL+ALT+S to open menu"
+    wanted_name = PLUGIN_NAME
+    wanted_hotkey = "Ctrl-Alt-S"
     IS_ARM = False
 
+    def init(self):
+        return ida_idaapi.PLUGIN_KEEP
+
     def run(self, arg):
+        self.progress_dialog = ProgressDialog()
         self.run_plugin()
 
-    def run_plugin(self):
-        # Check what processor we have
-        PySigMaker.IS_ARM = self.IsARM()
+    def term(self):
+        pass
 
-        form = SignatureMakerForm()
-        form.Compile()
-
-        # Execute the form and get results
-        ok = form.Execute()
-        if ok:
-            action = form.rAction.value
-            output_format = form.rOutputFormat.value
-            wildcard_operands = form.cGroupOptions.value & 1
-            continue_outside_of_function = form.cGroupOptions.value & 2
-
-        # Don't forget to free the form after execution
-        form.Free()
-
-        sig_type = SignatureType(output_format)
-
-        if action == 0:
-            # Find unique signature for current address
-            ea = idc.get_screen_ea()
-            idaapi.show_wait_box("Generating signature...")
-            signatures = self.GenerateUniqueSignatureForEA(
-                ea, wildcard_operands, continue_outside_of_function
-            )
-            self.PrintSignatureForEA(signatures, ea, sig_type)
-            idaapi.hide_wait_box()
-
-        elif action == 1:
-            # Find XREFs for current selection, generate signatures up to 250 bytes length
-            ea = idc.get_screen_ea()
-            xref_signatures = []
-            idaapi.show_wait_box(
-                "Finding references and generating signatures. This can take a while..."
-            )
-            self.FindXRefs(
-                ea,
-                wildcard_operands,
-                continue_outside_of_function,
-                xref_signatures,
-                250,
-            )
-            # Print top 5 shortest signatures
-            self.PrintXRefSignaturesForEA(ea, xref_signatures, sig_type, 5)
-            idaapi.hide_wait_box()
-
-        elif action == 2:
-            # Print selected code as signature
-            start, end = ida_kernwin.read_range_selection(idaapi.get_current_viewer())
-            if start and end:
-                idaapi.show_wait_box("Please stand by...")
-                self.PrintSelectedCode(start, end, sig_type, wildcard_operands)
-                idaapi.hide_wait_box()
-            else:
-                idc.msg("Select a range to copy the code\n")
-
-        elif action == 3:
-            # Search for a signature
-            input_signature = idaapi.ask_str("", idaapi.HIST_SRCH, "Enter a signature")
-            if input_signature:
-                idaapi.show_wait_box("Searching...")
-                self.SearchSignatureString(input_signature)
-                idaapi.hide_wait_box()
-
+    # -------------------------
+    # Processor and operand handling
+    # -------------------------
     def IsARM(self) -> bool:
-        return "ARM" in ida_idaapi.get_inf_structure().procname
+        procname = ida_ida.inf_get_procname()
+        return "ARM" in procname.upper()
 
-    def GetOperandOffsetARM(self, instruction, operand_offset, operand_length):
+    def GetOperandOffsetARM(self, instruction, operand_offset, operand_length) -> bool:
+        # For ARM: assume operand is 3 bytes if size==4, 7 bytes if size==8.
         for op in instruction.ops:
             if op.type in {
                 idaapi.o_mem,
@@ -347,51 +485,128 @@ class PySigMaker(ida_idaapi.plugin_t):
                 idaapi.o_imm,
             }:
                 operand_offset[0] = op.offb
-                operand_length[0] = (
-                    3 if instruction.size == 4 else 7 if instruction.size == 8 else 0
-                )
+                if instruction.size == 4:
+                    operand_length[0] = 3
+                elif instruction.size == 8:
+                    operand_length[0] = 7
+                else:
+                    operand_length[0] = 0
                 return True
         return False
 
-    def GetOperand(self, instruction, operand_offset, operand_length):
+    def GetOperand(
+        self, instruction, operand_offset, operand_length, wildcard_optimized
+    ) -> bool:
+        # For non-ARM: iterate over operands and apply the bitmask and optimized–instruction check.
         if self.IS_ARM:
             return self.GetOperandOffsetARM(instruction, operand_offset, operand_length)
-
         for op in instruction.ops:
-            if op.type != idaapi.o_void and op.offb != 0:
-                operand_offset[0] = op.offb
-                operand_length[0] = instruction.size - op.offb
-                return True
+            if op.type == idaapi.o_void:
+                continue
+            # Only process operands that are marked in our bitmask.
+            if (BIT(op.type) & WildcardableOperandTypeBitmask) == 0:
+                continue
+            isOptimizedInstr = op.offb == 0
+            if isOptimizedInstr and not wildcard_optimized:
+                continue
+            operand_offset[0] = op.offb
+            operand_length[0] = instruction.size - op.offb
+            return True
         return False
 
+    # -------------------------
+    # QIS scanning support
+    # -------------------------
+    def ReadSegmentsToBuffer(self) -> bytes:
+        buf = bytearray()
+        seg = idaapi.get_first_seg()
+        while seg:
+            size = seg.end_ea - seg.start_ea
+            data = ida_bytes.get_bytes(seg.start_ea, size)
+            if data:
+                buf.extend(data)
+            seg = idaapi.get_next_seg(seg)
+        return bytes(buf)
+
+    def parse_signature(self, sig_str: str):
+        # Convert a signature string (tokens separated by whitespace)
+        # into a list of tuples (value, is_wildcard)
+        tokens = sig_str.split()
+        pattern = []
+        for token in tokens:
+            if "?" in token:
+                pattern.append((0, True))
+            else:
+                try:
+                    val = int(token, 16)
+                except Exception:
+                    val = 0
+                pattern.append((val, False))
+        return pattern
+
+    def FindSignatureOccurencesQis(
+        self, ida_signature: str, skip_more_than_one: bool = False
+    ) -> list:
+        global FILE_BUFFER
+        if not FILE_BUFFER:
+            with ProgressDialog("Please stand by, copying segments..."):
+                FILE_BUFFER = self.ReadSegmentsToBuffer()
+        # Convert to QIS signature string: simply double each '?'
+        qis_signature = ida_signature.replace("?", "??")
+        pattern = self.parse_signature(qis_signature)
+        results = []
+        base_ea = ida_ida.inf_get_min_ea()
+        data = FILE_BUFFER
+        pat_len = len(pattern)
+        i = 0
+        while i <= len(data) - pat_len:
+            match = True
+            for j, (val, is_wildcard) in enumerate(pattern):
+                if not is_wildcard and data[i + j] != val:
+                    match = False
+                    break
+            if match:
+                results.append(base_ea + i)
+                if skip_more_than_one and len(results) > 1:
+                    break
+            i += 1
+        return results
+
     def FindSignatureOccurences(self, ida_signature: str) -> list:
+        if USE_QIS_SIGNATURE:
+            return self.FindSignatureOccurencesQis(ida_signature)
+        # Otherwise use IDA’s built-in binary pattern search.
         binary_pattern = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(
-            binary_pattern, ida_ida.cvar.inf.min_ea, ida_signature, 16
+            binary_pattern, ida_ida.inf_get_min_ea(), ida_signature, 16
         )
-
         results = []
-        ea = ida_ida.cvar.inf.min_ea
+        ea = ida_ida.inf_get_min_ea()
         while True:
-            occurence = ida_bytes.bin_search(
+            occurence, _ = ida_bytes.bin_search(
                 ea,
-                ida_ida.cvar.inf.max_ea,
+                ida_ida.inf_get_max_ea(),
                 binary_pattern,
                 ida_bytes.BIN_SEARCH_NOCASE | ida_bytes.BIN_SEARCH_FORWARD,
             )
             if occurence == idaapi.BADADDR:
-                return results
+                break
             results.append(occurence)
             ea = occurence + 1
+        return results
 
     def IsSignatureUnique(self, ida_signature: str) -> bool:
         return len(self.FindSignatureOccurences(ida_signature)) == 1
 
+    # -------------------------
+    # Signature generation for unique EA and a range
+    # -------------------------
     def GenerateUniqueSignatureForEA(
         self,
         ea,
         wildcard_operands,
         continue_outside_of_function,
+        wildcard_optimized,
         max_signature_length=1000,
         ask_longer_signature=True,
     ):
@@ -399,7 +614,6 @@ class PySigMaker(ida_idaapi.plugin_t):
             raise Unexpected("Invalid address")
         if not idaapi.is_code(ida_bytes.get_flags(ea)):
             raise Unexpected("Cannot create code signature for data")
-
         signature = []
         sig_part_length = 0
         current_function = idaapi.get_func(ea)
@@ -408,7 +622,6 @@ class PySigMaker(ida_idaapi.plugin_t):
         while True:
             if idaapi.user_cancelled():
                 raise Unexpected("Aborted")
-
             instruction = idaapi.insn_t()
             current_instruction_length = idaapi.decode_insn(
                 instruction, current_address
@@ -416,40 +629,37 @@ class PySigMaker(ida_idaapi.plugin_t):
             if current_instruction_length <= 0:
                 if not signature:
                     raise Unexpected("Failed to decode first instruction")
-
                 idc.msg(
                     f"Signature reached end of executable code @ {current_address:X}\n"
                 )
-                signature_string = BuildIDASignatureString(signature)
-                idc.msg(f"NOT UNIQUE Signature for {ea:X}: {signature_string}\n")
+                sig_str = BuildIDASignatureString(signature)
+                idc.msg(f"NOT UNIQUE Signature for {ea:X}: {sig_str}\n")
                 raise Unexpected("Signature not unique")
-
             if sig_part_length > max_signature_length:
                 if ask_longer_signature:
                     result = idaapi.ask_yn(
                         idaapi.ASKBTN_YES,
                         f"Signature is already at {len(signature)} bytes. Continue?",
                     )
-                    if result == 1:  # Yes
+                    if result == 1:
                         sig_part_length = 0
-                    elif result == 0:  # No
-                        signature_string = BuildIDASignatureString(signature)
-                        idc.msg(
-                            f"NOT UNIQUE Signature for {ea:X}: {signature_string}\n"
-                        )
+                    elif result == 0:
+                        sig_str = BuildIDASignatureString(signature)
+                        idc.msg(f"NOT UNIQUE Signature for {ea:X}: {sig_str}\n")
                         raise Unexpected("Signature not unique")
-                    else:  # Cancel
+                    else:
                         raise Unexpected("Aborted")
                 else:
                     raise Unexpected("Signature exceeded maximum length")
-
             sig_part_length += current_instruction_length
 
             operand_offset = [0]
             operand_length = [0]
             if (
                 wildcard_operands
-                and self.GetOperand(instruction, operand_offset, operand_length)
+                and self.GetOperand(
+                    instruction, operand_offset, operand_length, wildcard_optimized
+                )
                 and operand_length[0] > 0
             ):
                 AddBytesToSignature(
@@ -486,16 +696,15 @@ class PySigMaker(ida_idaapi.plugin_t):
                 and idaapi.get_func(current_address) != current_function
             ):
                 raise Unexpected("Signature left function scope")
-
         raise Unexpected("Unknown")
 
-    def GenerateSignatureForEARange(self, ea_start, ea_end, wildcard_operands):
+    def GenerateSignatureForEARange(
+        self, ea_start, ea_end, wildcard_operands, wildcard_optimized
+    ):
         if ea_start == idaapi.BADADDR or ea_end == idaapi.BADADDR:
             raise Unexpected("Invalid address")
-
         signature = []
         sig_part_length = 0
-
         if not idaapi.is_code(ida_bytes.get_flags(ea_start)):
             AddBytesToSignature(signature, ea_start, ea_end - ea_start, False)
             return signature
@@ -504,7 +713,6 @@ class PySigMaker(ida_idaapi.plugin_t):
         while True:
             if idaapi.user_cancelled():
                 raise Unexpected("Aborted")
-
             instruction = idaapi.insn_t()
             current_instruction_length = idaapi.decode_insn(
                 instruction, current_address
@@ -512,7 +720,6 @@ class PySigMaker(ida_idaapi.plugin_t):
             if current_instruction_length <= 0:
                 if not signature:
                     raise Unexpected("Failed to decode first instruction")
-
                 idc.msg(
                     f"Signature reached end of executable code @ {current_address:X}\n"
                 )
@@ -522,14 +729,15 @@ class PySigMaker(ida_idaapi.plugin_t):
                     )
                 TrimSignature(signature)
                 return signature
-
             sig_part_length += current_instruction_length
 
             operand_offset = [0]
             operand_length = [0]
             if (
                 wildcard_operands
-                and self.GetOperand(instruction, operand_offset, operand_length)
+                and self.GetOperand(
+                    instruction, operand_offset, operand_length, wildcard_optimized
+                )
                 and operand_length[0] > 0
             ):
                 AddBytesToSignature(
@@ -552,22 +760,23 @@ class PySigMaker(ida_idaapi.plugin_t):
                 AddBytesToSignature(
                     signature, current_address, current_instruction_length, False
                 )
-
             current_address += current_instruction_length
 
             if current_address >= ea_end:
                 TrimSignature(signature)
                 return signature
-
         raise Unexpected("Unknown")
 
+    # -------------------------
+    # Output functions
+    # -------------------------
     def PrintSignatureForEA(self, signature, ea, sig_type):
         if not signature:
             idc.msg(f"Error: {signature}\n")
             return
-        signature_str = FormatSignature(signature, sig_type)
-        idc.msg(f"Signature for {ea:X}: {signature_str}\n")
-        if not SetClipboardText(signature_str):
+        sig_str = FormatSignature(signature, sig_type)
+        idc.msg(f"Signature for {ea:X}: {sig_str}\n")
+        if not SetClipboardText(sig_str):
             idc.msg("Failed to copy to clipboard!")
 
     def FindXRefs(
@@ -575,98 +784,110 @@ class PySigMaker(ida_idaapi.plugin_t):
         ea,
         wildcard_operands,
         continue_outside_of_function,
+        wildcard_optimized,
         xref_signatures,
         max_signature_length,
     ):
-        xref = idaapi.xrefblk_t()
-
+        # Count code xrefs.
         xref_count = 0
-        for xref_ok in iter(lambda: xref.first_to(ea, idaapi.XREF_FAR), False):
-            if not idaapi.is_code(ida_bytes.get_flags(xref.frm)):
-                continue
-            xref_count += 1
-
+        xb = ida_xref.xrefblk_t()
+        if xb.first_to(ea, ida_xref.XREF_ALL):
+            while True:
+                if idaapi.is_code(ida_bytes.get_flags(xb.frm)):
+                    xref_count += 1
+                if not xb.next_to():
+                    break
+        # Process each xref.
+        xb = ida_xref.xrefblk_t()
+        if not xb.first_to(ea, ida_xref.XREF_ALL):
+            return
+        i = 0
         shortest_signature_length = max_signature_length + 1
-
-        for i, xref_ok in enumerate(
-            iter(lambda: xref.first_to(ea, idaapi.XREF_FAR), False)
-        ):
-            if idaapi.user_cancelled():
+        while True:
+            if self.progress_dialog.user_cancelled():
                 break
-
-            if not idaapi.is_code(ida_bytes.get_flags(xref.frm)):
+            if not idaapi.is_code(ida_bytes.get_flags(xb.frm)):
+                if not xb.next_to():
+                    break
                 continue
-
+            i += 1
             idaapi.replace_wait_box(
-                f"Processing xref {i + 1} of {xref_count} ({(i / xref_count) * 100.0:.1f}%)...\n\nSuitable Signatures: {len(xref_signatures)}\nShortest Signature: {shortest_signature_length if shortest_signature_length <= max_signature_length else 0} Bytes"
+                f"Processing xref {i} of {xref_count} ({(i / xref_count) * 100.0:.1f}%)...\n\n"
+                f"Suitable Signatures: {len(xref_signatures)}\n"
+                f"Shortest Signature: {shortest_signature_length if shortest_signature_length <= max_signature_length else 0} Bytes"
             )
-
-            signature = self.GenerateUniqueSignatureForEA(
-                xref.frm,
-                wildcard_operands,
-                continue_outside_of_function,
-                max_signature_length,
-                False,
-            )
-            if not signature:
-                continue
-
-            if len(signature) < shortest_signature_length:
-                shortest_signature_length = len(signature)
-
-            xref_signatures.append((xref.frm, signature))
-
-            xref_signatures.sort(key=lambda x: len(x[1]))
+            try:
+                sig = self.GenerateUniqueSignatureForEA(
+                    xb.frm,
+                    wildcard_operands,
+                    continue_outside_of_function,
+                    wildcard_optimized,
+                    max_signature_length,
+                    False,
+                )
+            except Exception:
+                sig = None
+            if sig:
+                if len(sig) < shortest_signature_length:
+                    shortest_signature_length = len(sig)
+                xref_signatures.append((xb.frm, sig))
+            if not xb.next_to():
+                break
+        xref_signatures.sort(key=lambda tup: len(tup[1]))
 
     def PrintXRefSignaturesForEA(self, ea, xref_signatures, sig_type, top_count):
         if not xref_signatures:
             idc.msg("No XREFs have been found for your address\n")
             return
-
         top_length = min(top_count, len(xref_signatures))
         idc.msg(
             f"Top {top_length} Signatures out of {len(xref_signatures)} xrefs for {ea:X}:\n"
         )
         for i in range(top_length):
             origin_address, signature = xref_signatures[i]
-            signature_str = FormatSignature(signature, sig_type)
-            idc.msg(f"XREF Signature #{i + 1} @ {origin_address:X}: {signature_str}\n")
-
+            sig_str = FormatSignature(signature, sig_type)
+            idc.msg(f"XREF Signature #{i+1} @ {origin_address:X}: {sig_str}\n")
             if i == 0:
-                SetClipboardText(signature_str)
+                SetClipboardText(sig_str)
 
-    def PrintSelectedCode(self, start, end, sig_type, wildcard_operands):
+    def PrintSelectedCode(
+        self, start, end, sig_type, wildcard_operands, wildcard_optimized
+    ):
         selection_size = end - start
-        assert selection_size > 0
-
-        signature = self.GenerateSignatureForEARange(start, end, wildcard_operands)
-        if not signature:
-            idc.msg(f"Error: {signature}\n")
+        if selection_size <= 0:
+            idc.msg("Invalid selection size\n")
             return
+        try:
+            signature = self.GenerateSignatureForEARange(
+                start, end, wildcard_operands, wildcard_optimized
+            )
+        except Unexpected as e:
+            idc.msg(f"Error: {str(e)}\n")
+            return
+        sig_str = FormatSignature(signature, sig_type)
+        idc.msg(f"Code for {start:X}-{end:X}: {sig_str}\n")
+        SetClipboardText(sig_str)
 
-        signature_str = FormatSignature(signature, sig_type)
-        idc.msg(f"Code for {start:X}-{end:X}: {signature_str}\n")
-        SetClipboardText(signature_str)
-
-    def SearchSignatureString(self, input):
+    def SearchSignatureString(self, input_str: str):
         converted_signature_string = ""
         string_mask = ""
-
-        match = re.search(r"x[x?]+", input)
-        if match:
-            string_mask = match.group(0)
+        # Try to detect a string mask like "xx????xx?xx"
+        m = re.search(r"x(?:x|\?)+", input_str)
+        if m:
+            string_mask = m.group(0)
         else:
-            match = re.search(r"0b[0,1]+", input)
-            if match:
-                bits = match.group(0)[2:]
+            m = re.search(r"0b(?:[01]+)", input_str)
+            if m:
+                bits = m.group(0)[2:]
                 reversed_bits = bits[::-1]
                 string_mask = "".join("x" if b == "1" else "?" for b in reversed_bits)
-
         if string_mask:
             raw_byte_strings = []
-            if GetRegexMatches(input, SIGNATURE_REGEX, raw_byte_strings) and len(
-                raw_byte_strings
-            ) == len(string_mask):
+            if GetRegexMatches(
+                input_str,
+                re.compile(r"\\x[0-9A-F]{2}", re.IGNORECASE),
+                raw_byte_strings,
+            ) and len(raw_byte_strings) == len(string_mask):
                 converted_signature = []
                 for i, m in enumerate(raw_byte_strings):
                     b = SignatureByte(int(m[2:], 16), string_mask[i] == "?")
@@ -674,9 +895,11 @@ class PySigMaker(ida_idaapi.plugin_t):
                 converted_signature_string = BuildIDASignatureString(
                     converted_signature
                 )
-            elif GetRegexMatches(input, SIGNATURE_REGEX_2, raw_byte_strings) and len(
-                raw_byte_strings
-            ) == len(string_mask):
+            elif GetRegexMatches(
+                input_str,
+                re.compile(r"(?:0x[0-9A-F]{2})+", re.IGNORECASE),
+                raw_byte_strings,
+            ) and len(raw_byte_strings) == len(string_mask):
                 converted_signature = []
                 for i, m in enumerate(raw_byte_strings):
                     b = SignatureByte(int(m[2:], 16), string_mask[i] == "?")
@@ -689,12 +912,13 @@ class PySigMaker(ida_idaapi.plugin_t):
                     f'Detected mask "{string_mask}" but failed to match corresponding bytes\n'
                 )
         else:
-            input = re.sub(r"[)(\[\]]+", "", input)
-            input = re.sub(r"^\s+", "", input)
-            input = re.sub(r"[? ]+$", "", input) + " "
-            input = re.sub(r"\\?\\x", "", input)  # Simplify hex pattern matching
-            input = re.sub(r"\s+", " ", input)  # Normalize spaces
-            converted_signature_string = input
+            # Remove extraneous characters and normalize
+            s = re.sub(r"[\)\(\[\]]+", "", input_str)
+            s = re.sub(r"^\s+", "", s)
+            s = re.sub(r"[? ]+$", "", s) + " "
+            s = re.sub(r"\\?\\x", "", s)
+            s = re.sub(r"\s+", " ", s)
+            converted_signature_string = s
 
         if not converted_signature_string:
             idc.msg("Unrecognized signature type\n")
@@ -708,17 +932,129 @@ class PySigMaker(ida_idaapi.plugin_t):
         for ea in signature_matches:
             idc.msg(f"Match @ {ea:X}\n")
 
+    # -------------------------
+    # Main plugin UI and dispatch
+    # -------------------------
+    def run_plugin(self):
+        # Determine processor type and set globals.
+        self.IS_ARM = self.IsARM()
+        proc = ida_ida.inf_get_procname()
+        global WildcardableOperandTypeBitmask
+        if self.IS_ARM:
+            WildcardableOperandTypeBitmask = (
+                BIT(idc.o_mem)
+                | BIT(idc.o_phrase)
+                | BIT(idc.o_displ)
+                | BIT(idc.o_far)
+                | BIT(idc.o_near)
+                | BIT(idc.o_imm)
+            )
+        else:
+            # from "Intel.hpp"
+            # define o_xmmreg        o_idpspec5      // xmm register
+            # define o_ymmreg        o_idpspec5+1    // ymm register
+            # define o_zmmreg        o_idpspec5+2    // zmm register
+            # define o_kreg          o_idpspec5+3    // opmask register
+            o_ymmreg = idc.o_xmmreg + 1
+            o_zmmreg = o_ymmreg + 1
+            o_kreg = o_zmmreg + 1
+            WildcardableOperandTypeBitmask = (
+                BIT(idc.o_mem)
+                | BIT(idc.o_phrase)
+                | BIT(idc.o_displ)
+                | BIT(idc.o_far)
+                | BIT(idc.o_near)
+                | BIT(idc.o_imm)
+                | BIT(idc.o_trreg)
+                | BIT(idc.o_dbreg)
+                | BIT(idc.o_crreg)
+                | BIT(idc.o_fpreg)
+                | BIT(idc.o_mmxreg)
+                | BIT(idc.o_xmmreg)
+                | BIT(o_ymmreg)
+                | BIT(o_zmmreg)
+                | BIT(o_kreg)
+            )
 
-# Register the plugin
+        # Show the main form.
+        form = SignatureMakerForm()
+        form.Compile()
+        ok = form.Execute()
+        if not ok:
+            form.Free()
+            return
+
+        action = form.rAction.value
+        output_format = form.rOutputFormat.value
+        wildcard_operands = form.cGroupOptions.value & 1
+        continue_outside_of_function = form.cGroupOptions.value & 2
+        wildcard_optimized = form.cGroupOptions.value & 4
+
+        # If the configuration buttons were pressed, they may have updated globals.
+        form.Free()
+
+        sig_type = SignatureType(output_format)
+
+        try:
+            if action == 0:
+                # Create unique signature for current code address.
+                ea = ida_kernwin.get_screen_ea()
+                with self.progress_dialog("Generating signature..."):
+                    sig = self.GenerateUniqueSignatureForEA(
+                        ea,
+                        wildcard_operands,
+                        continue_outside_of_function,
+                        wildcard_optimized,
+                        MAX_SINGLE_SIGNATURE_LENGTH,
+                    )
+                    self.PrintSignatureForEA(sig, ea, sig_type)
+            elif action == 1:
+                # Find XREF signatures.
+                ea = ida_kernwin.get_screen_ea()
+                xref_signatures = []
+                with self.progress_dialog(
+                    "Finding references and generating signatures. This can take a while..."
+                ):
+                    self.FindXRefs(
+                        ea,
+                        wildcard_operands,
+                        continue_outside_of_function,
+                        wildcard_optimized,
+                        xref_signatures,
+                        MAX_XREF_SIGNATURE_LENGTH,
+                    )
+                    self.PrintXRefSignaturesForEA(
+                        ea, xref_signatures, sig_type, PRINT_TOP_X
+                    )
+            elif action == 2:
+                # Copy selected code.
+                sel = ida_kernwin.read_range_selection(idaapi.get_current_viewer())
+                if sel:
+                    start, end = sel
+                    with self.progress_dialog("Please stand by..."):
+                        self.PrintSelectedCode(
+                            start, end, sig_type, wildcard_operands, wildcard_optimized
+                        )
+                else:
+                    idc.msg("Select a range to copy the code\n")
+            elif action == 3:
+                # Search for a signature.
+                input_signature = idaapi.ask_str(
+                    "", idaapi.HIST_SRCH, "Enter a signature"
+                )
+                if input_signature:
+                    with self.progress_dialog("Searching..."):
+                        self.SearchSignatureString(input_signature)
+        except Unexpected as e:
+            idc.msg(f"Error: {str(e)}\n")
+        except Exception as e:
+            print(e, os.linesep, traceback.format_exc())
+            return
+
+
+# -------------------------
+# Plugin entry point
+# -------------------------
 def PLUGIN_ENTRY():
     return PySigMaker()
 
-
-# PySigMaker().run(None)
-# form = SignatureMakerForm()
-# form.Compile()
-
-# # Execute the form and get results
-# ok = form.Execute()
-
-# form.Free()
