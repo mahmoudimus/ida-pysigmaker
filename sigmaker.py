@@ -4,6 +4,7 @@ https://github.com/mahmoudimus/ida-pysigmaker
 
 by @mahmoudimus (Mahmoud Abdelkader)
 """
+
 import ctypes
 import enum
 import os
@@ -15,6 +16,7 @@ import traceback
 import ida_bytes
 import ida_ida
 import ida_idaapi
+import ida_idp
 import ida_kernwin
 import ida_xref
 import idaapi
@@ -34,26 +36,28 @@ def _IsProcessorFeaturePresent(feature: int) -> bool:
 
 def _IsAVX2Available() -> bool:
     # Check for AVX2 feature to enable QIS signature scanning.
-    PF_AVX2_INSTRUCTIONS_AVAILABLE = 10    
+    PF_AVX2_INSTRUCTIONS_AVAILABLE = 10
     return _IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)
 
-        
-# Globals 
+
+# Globals
 __author__ = "mahmoudimus"
 __version__ = "1.0.9"
 
 PLUGIN_NAME = "Signature Maker (py)"
 PLUGIN_VERSION = __version__
 PLUGIN_AUTHOR = __author__
-USE_QIS_SIGNATURE = False # _IsAVX2Available()
-WILDCARD_OPTIMIZED_INSTRUCTION = True
+USE_QIS_SIGNATURE = False  # _IsAVX2Available()  # TODO: add this later
 PRINT_TOP_X = 5
 MAX_SINGLE_SIGNATURE_LENGTH = 1000
 MAX_XREF_SIGNATURE_LENGTH = 250
 FILE_BUFFER = None
+PROCESSOR_ARCH = ida_idp.ph_get_id()  # Check what processor we have
+WILDCARD_OPTIMIZED_INSTRUCTION = True
 WildcardableOperandTypeBitmask = 0  # Will be set based on processor
 
 # Helpers
+
 
 def BIT(x):
     return 1 << x
@@ -339,6 +343,151 @@ class Unexpected(Exception):
     pass
 
 
+class ConfigureOperandWildcardBitmaskForm(ida_kernwin.Form):
+    """Interactive Form to configure wildcardable operands using checkboxes."""
+
+    def __init__(self):
+        F = ida_kernwin.Form
+        # Define the form layout
+        form_text = """BUTTON YES* OK
+BUTTON CANCEL Cancel
+Wildcardable Operands
+{FormChangeCb}
+Select operand types that should be wildcarded:
+
+<General Register (al, ax, es, ds...):{opt1}>
+<Direct Memory Reference (DATA) :{opt2}>
+<Memory Ref [Base Reg + Index Reg] :{opt3}>
+<Memory Ref [Base Reg + Index Reg + Displacement] :{opt4}>
+<Immediate Value :{opt5}>
+<Immediate Far Address (CODE) :{opt6}>
+<Immediate Near Address (CODE) :{opt7}>"""
+        registers = ["opt1", "opt2", "opt3", "opt4", "opt5", "opt6", "opt7"]
+
+        # Processor-specific operand types
+        PROCESSOR_ARCH = ida_idp.ph_get_id()
+        if PROCESSOR_ARCH == ida_idp.PLFM_386:
+            form_text += """
+<Trace Register :{opt8}>
+<Debug Register :{opt9}>
+<Control Register :{opt10}>
+<Floating Point Register :{opt11}>
+<MMX Register :{opt12}>
+<XMM Register :{opt13}>
+<YMM Register :{opt14}>
+<ZMM Register :{opt15}>
+<Opmask Register :{opt16}>{cWildcardableOperands}>"""
+            registers.extend(
+                [
+                    "opt8",
+                    "opt9",
+                    "opt10",
+                    "opt11",
+                    "opt12",
+                    "opt13",
+                    "opt14",
+                    "opt15",
+                    "opt16",
+                ]
+            )
+        elif PROCESSOR_ARCH == ida_idp.PLFM_ARM:
+            form_text += """
+<(Unused) :{opt8}>
+<Register list (for LDM/STM) :{opt9}>
+<Coprocessor register list (for CDP) :{opt10}>
+<Coprocessor register (for LDC/STC) :{opt11}>
+<Floating point register list :{opt12}>
+<Arbitrary text stored in the operand :{opt13}>
+<ARM condition as an operand :{opt14}>{cWildcardableOperands}>"""
+            registers.extend(
+                ["opt8", "opt9", "opt10", "opt11", "opt12", "opt13", "opt14"]
+            )
+        elif PROCESSOR_ARCH == ida_idp.PLFM_PPC:
+            form_text += """
+<Special purpose register :{opt8}>
+<Two FPRs :{opt9}>
+<SH & MB & ME :{opt10}>
+<crfield :{opt11}>
+<crbit :{opt12}>
+<Device control register :{opt13}>{cWildcardableOperands}>"""
+            registers.extend(["opt8", "opt9", "opt10", "opt11", "opt12", "opt13"])
+        else:
+            form_text += """{cWildcardableOperands}>
+"""
+        # Shift by one because we skip o_void
+        options = WildcardableOperandTypeBitmask >> 1
+        # Define checkboxes
+        controls = {
+            "FormChangeCb": F.FormChangeCb(self.OnFormChange),
+            "cWildcardableOperands": F.ChkGroupControl(
+                tuple(registers),
+                value=options,
+            ),
+        }
+        # Initialize form
+        super().__init__(form_text, controls)
+
+    def OnFormChange(self, fid):
+        """Handle form changes."""
+        if fid == self.cWildcardableOperands.id:
+            global WildcardableOperandTypeBitmask
+            # print(f"cWildcardableOperands changed: {self.GetControlValue(self.cWildcardableOperands):06x}")
+            # Re-shift by one because we skipped o_void
+            WildcardableOperandTypeBitmask = (
+                self.GetControlValue(self.cWildcardableOperands) << 1
+            )
+        return 1
+
+
+class ConfigureOptionsForm(ida_kernwin.Form):
+    """Interactive Form to configure XREF and signature generation options."""
+
+    def __init__(self):
+        F = ida_kernwin.Form
+
+        # Define the form layout
+        form_text = """BUTTON YES* OK
+BUTTON CANCEL Cancel
+Options
+
+<#Print top X shortest signatures when generating xref signatures#Print top X XREF signatures     :{opt1}>
+<#Stop after reaching X bytes when generating a single signature#Maximum single signature length :{opt2}>
+<#Stop after reaching X bytes when generating xref signatures#Maximum xref signature length   :{opt3}>
+"""
+
+        # Define numerical input fields (corresponding to `u` in C++)
+        self.controls = {
+            "opt1": F.NumericInput(tp=F.FT_DEC),  # PRINT_TOP_X
+            "opt2": F.NumericInput(tp=F.FT_DEC),  # MAX_SINGLE_SIGNATURE_LENGTH
+            "opt3": F.NumericInput(tp=F.FT_DEC),  # MAX_XREF_SIGNATURE_LENGTH
+        }
+
+        # Initialize form
+        super().__init__(form_text, self.controls)
+
+    def ExecuteForm(self):
+        """Execute the form and apply changes."""
+        global PRINT_TOP_X, MAX_SINGLE_SIGNATURE_LENGTH, MAX_XREF_SIGNATURE_LENGTH
+
+        # Pre-fill form values
+        self.controls["opt1"].value = PRINT_TOP_X
+        self.controls["opt2"].value = MAX_SINGLE_SIGNATURE_LENGTH
+        self.controls["opt3"].value = MAX_XREF_SIGNATURE_LENGTH
+
+        result = self.Execute()
+        # Show form
+        if result != 1:
+            self.Free()
+            return result
+
+        # Apply the new values to the global variables
+        PRINT_TOP_X = self.controls["opt1"].value
+        MAX_SINGLE_SIGNATURE_LENGTH = self.controls["opt2"].value
+        MAX_XREF_SIGNATURE_LENGTH = self.controls["opt3"].value
+        self.Free()
+        return result
+
+
 class SignatureMakerForm(ida_kernwin.Form):
     def __init__(self):
         F = ida_kernwin.Form
@@ -411,43 +560,74 @@ Quick Options:
         return 1
 
     def ConfigureOperandWildcardBitmask(self, code=0):
-        global WildcardableOperandTypeBitmask
-        current = hex(WildcardableOperandTypeBitmask)
-        new_val = ida_kernwin.ask_str(
-            current, 0, "Enter new WildcardableOperandTypeBitmask (hex):"
-        )
-        if new_val:
-            try:
-                WildcardableOperandTypeBitmask = int(new_val, 16)
-            except Exception:
-                ida_kernwin.info("Invalid input for operand bitmask.")
+        form = ConfigureOperandWildcardBitmaskForm()
+        form.Compile()
+        ok = form.Execute()
+        if not ok:
+            return 0
         return 1
 
     def ConfigureOptions(self, code=0):
-        global PRINT_TOP_X, MAX_SINGLE_SIGNATURE_LENGTH, MAX_XREF_SIGNATURE_LENGTH
-        current = (
-            f"{PRINT_TOP_X},{MAX_SINGLE_SIGNATURE_LENGTH},{MAX_XREF_SIGNATURE_LENGTH}"
-        )
-        new_val = ida_kernwin.ask_str(
-            current,
-            0,
-            "Enter PRINT_TOP_X, MAX_SINGLE_SIGNATURE_LENGTH, MAX_XREF_SIGNATURE_LENGTH (comma-separated):",
-        )
-        if new_val:
-            parts = new_val.split(",")
-            if len(parts) >= 3:
-                try:
-                    PRINT_TOP_X = int(parts[0].strip())
-                    MAX_SINGLE_SIGNATURE_LENGTH = int(parts[1].strip())
-                    MAX_XREF_SIGNATURE_LENGTH = int(parts[2].strip())
-                except Exception:
-                    ida_kernwin.info("Invalid input for options.")
-        return 1
+        """Launch the options configuration form."""
+        form = ConfigureOptionsForm()
+        form.Compile()
+        return form.ExecuteForm()
 
 
 # -------------------------
 # The main plugin class
 # -------------------------
+
+
+def set_wildcardable_operand_type_bitmask():
+    global WildcardableOperandTypeBitmask
+
+    # Default wildcard setting depending on processor arch
+    if PROCESSOR_ARCH == ida_idp.PLFM_386:
+        o_ymmreg = idc.o_xmmreg + 1
+        o_zmmreg = o_ymmreg + 1
+        o_kreg = o_zmmreg + 1
+        WildcardableOperandTypeBitmask = (
+            BIT(idc.o_mem)
+            | BIT(idc.o_phrase)
+            | BIT(idc.o_displ)
+            | BIT(idc.o_far)
+            | BIT(idc.o_near)
+            | BIT(idc.o_imm)
+            | BIT(idc.o_trreg)
+            | BIT(idc.o_dbreg)
+            | BIT(idc.o_crreg)
+            | BIT(idc.o_fpreg)
+            | BIT(idc.o_mmxreg)
+            | BIT(idc.o_xmmreg)
+            | BIT(o_ymmreg)
+            | BIT(o_zmmreg)
+            | BIT(o_kreg)
+        )
+    elif PROCESSOR_ARCH == ida_idp.PLFM_ARM:
+        WildcardableOperandTypeBitmask = (
+            BIT(idc.o_mem)
+            | BIT(idc.o_phrase)
+            | BIT(idc.o_displ)
+            | BIT(idc.o_far)
+            | BIT(idc.o_near)
+            | BIT(idc.o_imm)
+        )
+    elif PROCESSOR_ARCH == ida_idp.PLFM_MIPS:
+        WildcardableOperandTypeBitmask = (
+            BIT(idc.o_mem) | BIT(idc.o_far) | BIT(idc.o_near)
+        )
+    else:
+        WildcardableOperandTypeBitmask = (
+            BIT(idc.o_mem)
+            | BIT(idc.o_phrase)
+            | BIT(idc.o_displ)
+            | BIT(idc.o_far)
+            | BIT(idc.o_near)
+            | BIT(idc.o_imm)
+        )
+
+
 class PySigMaker(ida_idaapi.plugin_t):
     flags = ida_idaapi.PLUGIN_KEEP
     comment = f"{PLUGIN_NAME} v{PLUGIN_VERSION} for IDA Pro by {PLUGIN_AUTHOR}"
@@ -938,43 +1118,8 @@ class PySigMaker(ida_idaapi.plugin_t):
     def run_plugin(self):
         # Determine processor type and set globals.
         self.IS_ARM = self.IsARM()
-        proc = ida_ida.inf_get_procname()
-        global WildcardableOperandTypeBitmask
-        if self.IS_ARM:
-            WildcardableOperandTypeBitmask = (
-                BIT(idc.o_mem)
-                | BIT(idc.o_phrase)
-                | BIT(idc.o_displ)
-                | BIT(idc.o_far)
-                | BIT(idc.o_near)
-                | BIT(idc.o_imm)
-            )
-        else:
-            # from "Intel.hpp"
-            # define o_xmmreg        o_idpspec5      // xmm register
-            # define o_ymmreg        o_idpspec5+1    // ymm register
-            # define o_zmmreg        o_idpspec5+2    // zmm register
-            # define o_kreg          o_idpspec5+3    // opmask register
-            o_ymmreg = idc.o_xmmreg + 1
-            o_zmmreg = o_ymmreg + 1
-            o_kreg = o_zmmreg + 1
-            WildcardableOperandTypeBitmask = (
-                BIT(idc.o_mem)
-                | BIT(idc.o_phrase)
-                | BIT(idc.o_displ)
-                | BIT(idc.o_far)
-                | BIT(idc.o_near)
-                | BIT(idc.o_imm)
-                | BIT(idc.o_trreg)
-                | BIT(idc.o_dbreg)
-                | BIT(idc.o_crreg)
-                | BIT(idc.o_fpreg)
-                | BIT(idc.o_mmxreg)
-                | BIT(idc.o_xmmreg)
-                | BIT(o_ymmreg)
-                | BIT(o_zmmreg)
-                | BIT(o_kreg)
-            )
+
+        set_wildcardable_operand_type_bitmask()
 
         # Show the main form.
         form = SignatureMakerForm()
@@ -1052,9 +1197,5 @@ class PySigMaker(ida_idaapi.plugin_t):
             return
 
 
-# -------------------------
-# Plugin entry point
-# -------------------------
 def PLUGIN_ENTRY():
     return PySigMaker()
-
