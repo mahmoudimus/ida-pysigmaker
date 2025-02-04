@@ -1,16 +1,33 @@
 # ida-pysigmaker
 A port of @A200K's [IDA-Pro-SigMaker](https://github.com/A200K/IDA-Pro-SigMaker) to IDA Python.
 
-Signature Maker Plugin for IDA Pro 8.3
+Signature Maker Plugin for IDA Pro 9.0+
 
 ## Requirements
 - IDA Python
 - Python 3
 
 ## Installation
-Drop into plugins folder of your IDA installation.
 
-`%AppData%\Hex-Rays\IDA Pro\plugins`
+This python port of sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) Python 3 support. It takes zero third party dependencies, making the code both portable and easy to install.
+
+- Copy `sigmaker.py` into the /plugins/ folder to the plugin directory!
+- Restart your disassembler.
+
+That's it!
+
+### Need to find your plugin directory?
+
+From IDA's Python console run the following command to find its plugin directory:
+```python
+import idaapi, os; print(os.path.join(idaapi.get_user_idadir(), "plugins"))
+```
+
+### Where and what is my default user directory?
+The user directory is a location where IDA stores some of the global settings and which can be used for some additional customization. 
+Default location:
+- On Windows: `%APPDATA%/Hex-Rays/IDA Pro`
+- On Linux and Mac: `$HOME/.idapro`
 
 ## Usage
 In disassembly view, select a line you want to generate a signature for, and press 
