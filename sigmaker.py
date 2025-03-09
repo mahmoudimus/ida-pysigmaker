@@ -3,6 +3,7 @@ sigmaker.py - IDA Python port of Signature Maker (from A200K)
 https://github.com/mahmoudimus/ida-pysigmaker
 
 by @mahmoudimus (Mahmoud Abdelkader)
+updated for ida pro 9.0
 """
 
 import ctypes
@@ -763,7 +764,7 @@ class PySigMaker(ida_idaapi.plugin_t):
         results = []
         ea = ida_ida.inf_get_min_ea()
         while True:
-            occurence, _ = ida_bytes.bin_search(
+            occurence, _ = ida_bytes.bin_search3(
                 ea,
                 ida_ida.inf_get_max_ea(),
                 binary_pattern,
