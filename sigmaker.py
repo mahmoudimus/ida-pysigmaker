@@ -1209,9 +1209,9 @@ def get_selected_addresses(ctx):
 
     # maybe it's the same line?
     p0, p1 = ida_kernwin.twinpos_t(), ida_kernwin.twinpos_t()
-    ida_kernwin.read_selection(ctx.widget, p0, p1)
-    p0.place(ctx.widget)
-    p1.place(ctx.widget)
+    ida_kernwin.read_selection(ctx, p0, p1)
+    p0.place(ctx)
+    p1.place(ctx)
     if p0.at and p1.at:
         start_ea = p0.at.toea()
         end_ea = p1.at.toea()
@@ -1220,24 +1220,26 @@ def get_selected_addresses(ctx):
             end_ea = idc.get_item_end(start_ea)
             return start_ea, end_ea
 
-    print("No range selected!")
-    current_ea = idaapi.get_screen_ea()
-    if not start_ea:
-        start_ea = current_ea
-        print(f"Cannot determine start address, using current address: 0x{start_ea:X}")
-
+    # if we are here, we haven't selected anything, so we use the current address
+    start_ea = idaapi.get_screen_ea()
     try:
         end_ea = ida_kernwin.ask_addr(start_ea, "Enter end address for selection:")
     finally:
         # restore the cursor to the original address
-        idc.jumpto(current_ea)
+        idc.jumpto(start_ea)
+
+    if end_ea and end_ea <= start_ea:
+        print(
+            f"Error: End address 0x{end_ea:X} must be greater than start address 0x{start_ea:X}."
+        )
+        end_ea = None
 
     if end_ea is None:
-        print("Selection canceled. Returning start address.")
-        return start_ea, None
-    if end_ea <= start_ea:
-        print("Error: End address must be greater than start address.")
-        return start_ea, None
+        # if we canceled the dialog, let's assume the user wants
+        # to select just the line they're on
+        end_ea = idc.get_item_end(start_ea)
+        print(f"No end address selected, using line end: 0x{end_ea:X}")
+
     return start_ea, end_ea
 
 
