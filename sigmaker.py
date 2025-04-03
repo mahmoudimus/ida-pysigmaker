@@ -42,7 +42,7 @@ def _IsAVX2Available() -> bool:
 
 # Globals
 __author__ = "mahmoudimus"
-__version__ = "1.0.9"
+__version__ = "1.1.0"
 
 PLUGIN_NAME = "Signature Maker (py)"
 PLUGIN_VERSION = __version__
