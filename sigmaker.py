@@ -42,7 +42,7 @@ def _IsAVX2Available() -> bool:
 
 # Globals
 __author__ = "mahmoudimus"
-__version__ = "1.1.0"
+__version__ = "1.0.9"
 
 PLUGIN_NAME = "Signature Maker (py)"
 PLUGIN_VERSION = __version__
@@ -628,6 +628,52 @@ def set_wildcardable_operand_type_bitmask():
         )
 
 
+class _ActionHandler(idaapi.action_handler_t):
+
+    def __init__(self, action_function):
+        super().__init__()
+        self.action_function = action_function
+
+    def activate(self, ctx):
+        self.action_function(ctx=ctx)
+        return 1
+
+    def update(self, ctx):
+        if ctx.widget_type == idaapi.BWN_DISASM:
+            return idaapi.AST_ENABLE_FOR_WIDGET
+        return idaapi.AST_DISABLE_FOR_WIDGET
+
+
+def is_disassembly_widget(widget, popup, ctx):
+    return idaapi.get_widget_type(widget) == idaapi.BWN_DISASM
+
+
+class _PopupHook(idaapi.UI_Hooks):
+
+    def __init__(
+        self, action_name, predicate=None, widget_populator=None, category=None
+    ):
+        super().__init__()
+        self.action_name = action_name
+        self.predicate = predicate or is_disassembly_widget
+        self.widget_populator = widget_populator or self._default_populator
+        self.category = category
+
+    def term(self):
+        idaapi.unregister_action(self.action_name)
+
+    @staticmethod
+    def _default_populator(instance, widget, popup_handle, ctx):
+        if instance.predicate(widget, popup_handle, ctx):
+            args = [widget, popup_handle, instance.action_name]
+            if instance.category:
+                args.append(f"{instance.category}/")
+            idaapi.attach_action_to_popup(*args)
+
+    def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
+        return self.widget_populator(self, widget, popup_handle, ctx)
+
+
 class PySigMaker(ida_idaapi.plugin_t):
     flags = ida_idaapi.PLUGIN_KEEP
     comment = f"{PLUGIN_NAME} v{PLUGIN_VERSION} for IDA Pro by {PLUGIN_AUTHOR}"
@@ -636,15 +682,49 @@ class PySigMaker(ida_idaapi.plugin_t):
     wanted_hotkey = "Ctrl-Alt-S"
     IS_ARM = False
 
+    ACTION_SHOW_SIGMAKER = "pysigmaker:show"
+
     def init(self):
+        self.progress_dialog = ProgressDialog()
+        self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
+        self._register_action()
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
-        self.progress_dialog = ProgressDialog()
         self.run_plugin()
 
     def term(self):
-        pass
+        # unregister our actions & free their resources
+        self._deregister_action()
+        # unhook our plugin hooks
+        self._deinit_hooks(*self._hooks)
+
+    def _init_hooks(self, *hooks):
+        for hook in hooks:
+            hook.hook()
+        return hooks
+
+    def _deinit_hooks(self, *hooks):
+        for hook in hooks:
+            hook.unhook()
+
+    def _register_actions(self):
+        # If the action is already registered, unregister it first.
+        self._deregister_actions()
+        # Describe the action using python3 copy
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_SHOW_SIGMAKER,  # The action name.
+                "SigMaker",  # The action text.
+                _ActionHandler(self.run_plugin),  # The action handler.
+                self.wanted_hotkey,  # Optional: action shortcut
+                "Show the signature maker dialog.",  # Optional: tooltip
+                154,  # magnifying glass icon
+            )
+        )
+
+    def _deregister_actions(self):
+        return idaapi.unregister_action(self.ACTION_SHOW_SIGMAKER)
 
     # -------------------------
     # Processor and operand handling
@@ -1121,7 +1201,7 @@ class PySigMaker(ida_idaapi.plugin_t):
     # -------------------------
     # Main plugin UI and dispatch
     # -------------------------
-    def run_plugin(self):
+    def run_plugin(self, ctx=None):
         # Determine processor type and set globals.
         self.IS_ARM = self.IsARM()
 
