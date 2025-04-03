@@ -762,8 +762,14 @@ class PySigMaker(ida_idaapi.plugin_t):
         )
         results = []
         ea = ida_ida.inf_get_min_ea()
+        _bin_search = getattr(ida_bytes, "bin_search", None)
+        # See https://github.com/mahmoudimus/ida-pysigmaker/pull/2
+        # In particular this discussion:
+        # https://github.com/mahmoudimus/ida-pysigmaker/pull/2#discussion_r1991913976
+        if not _bin_search:
+            _bin_search = getattr(ida_bytes, "bin_search3")
         while True:
-            occurence, _ = ida_bytes.bin_search(
+            occurence, _ = _bin_search(
                 ea,
                 ida_ida.inf_get_max_ea(),
                 binary_pattern,
@@ -1173,15 +1179,14 @@ class PySigMaker(ida_idaapi.plugin_t):
                     )
             elif action == 2:
                 # Copy selected code.
-                sel = ida_kernwin.read_range_selection(idaapi.get_current_viewer())
-                if sel:
-                    start, end = sel
+                start, end = get_selected_addresses(idaapi.get_current_viewer())
+                if start and end:
                     with self.progress_dialog("Please stand by..."):
                         self.PrintSelectedCode(
                             start, end, sig_type, wildcard_operands, wildcard_optimized
                         )
                 else:
-                    idc.msg("Select a range to copy the code\n")
+                    idc.msg("Select a range to copy the code!\n")
             elif action == 3:
                 # Search for a signature.
                 input_signature = idaapi.ask_str(
@@ -1195,6 +1200,45 @@ class PySigMaker(ida_idaapi.plugin_t):
         except Exception as e:
             print(e, os.linesep, traceback.format_exc())
             return
+
+
+def get_selected_addresses(ctx):
+    is_selected, start_ea, end_ea = idaapi.read_range_selection(ctx)
+    if is_selected:
+        return start_ea, end_ea
+
+    # maybe it's the same line?
+    p0, p1 = ida_kernwin.twinpos_t(), ida_kernwin.twinpos_t()
+    ida_kernwin.read_selection(ctx.widget, p0, p1)
+    p0.place(ctx.widget)
+    p1.place(ctx.widget)
+    if p0.at and p1.at:
+        start_ea = p0.at.toea()
+        end_ea = p1.at.toea()
+        if start_ea == end_ea:
+            start_ea = idc.get_item_head(start_ea)
+            end_ea = idc.get_item_end(start_ea)
+            return start_ea, end_ea
+
+    print("No range selected!")
+    current_ea = idaapi.get_screen_ea()
+    if not start_ea:
+        start_ea = current_ea
+        print(f"Cannot determine start address, using current address: 0x{start_ea:X}")
+
+    try:
+        end_ea = ida_kernwin.ask_addr(start_ea, "Enter end address for selection:")
+    finally:
+        # restore the cursor to the original address
+        idc.jumpto(current_ea)
+
+    if end_ea is None:
+        print("Selection canceled. Returning start address.")
+        return start_ea, None
+    if end_ea <= start_ea:
+        print("Error: End address must be greater than start address.")
+        return start_ea, None
+    return start_ea, end_ea
 
 
 def PLUGIN_ENTRY():
