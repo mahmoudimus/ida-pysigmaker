@@ -42,7 +42,7 @@ def _IsAVX2Available() -> bool:
 
 # Globals
 __author__ = "mahmoudimus"
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 PLUGIN_NAME = "Signature Maker (py)"
 PLUGIN_VERSION = __version__
@@ -687,7 +687,7 @@ class PySigMaker(ida_idaapi.plugin_t):
     def init(self):
         self.progress_dialog = ProgressDialog()
         self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
-        self._register_action()
+        self._register_actions()
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
@@ -695,7 +695,7 @@ class PySigMaker(ida_idaapi.plugin_t):
 
     def term(self):
         # unregister our actions & free their resources
-        self._deregister_action()
+        self._deregister_actions()
         # unhook our plugin hooks
         self._deinit_hooks(*self._hooks)
 
